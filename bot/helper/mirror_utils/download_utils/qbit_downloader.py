@@ -1,14 +1,13 @@
 from hashlib import sha1
 from base64 import b16encode, b32decode
 from bencoding import bencode, bdecode
-from os import path as ospath, listdir
 from time import sleep, time
 from re import search as re_search
 
 from bot import download_dict, download_dict_lock, BASE_URL, get_client, STOP_DUPLICATE, TORRENT_TIMEOUT, LOGGER
 from bot.helper.mirror_utils.status_utils.qbit_download_status import QbDownloadStatus
 from bot.helper.mirror_utils.upload_utils.gdriveTools import GoogleDriveHelper
-from bot.helper.telegram_helper.message_utils import sendMessage, sendMarkup, deleteMessage, sendStatusMessage, update_all_messages
+from bot.helper.telegram_helper.message_utils import sendMessage, sendMarkup, deleteMessage, sendStatusMessage, update_all_messages, sendFile
 from bot.helper.ext_utils.bot_utils import get_readable_time, setInterval, bt_selection_buttons
 from bot.helper.ext_utils.fs_utils import clean_unwanted, get_base_name
 
@@ -17,23 +16,22 @@ class QbDownloader:
     POLLING_INTERVAL = 3
 
     def __init__(self, listener):
-        self.select = False
         self.is_seeding = False
-        self.client = None
         self.ext_hash = ''
-        self.__periodic = None
+        self.client = get_client()
         self.__listener = listener
         self.__path = ''
         self.__name = ''
         self.__stalled_time = time()
         self.__uploaded = False
-        self.__dupChecked = False
         self.__rechecked = False
+        self.__stopDup_check = False
+        self.__select = False
+        self.__periodic = None
 
-    def add_qb_torrent(self, link, path, select):
+    def add_qb_torrent(self, link, path, select, ratio, seed_time):
         self.__path = path
-        self.select = select
-        self.client = get_client()
+        self.__select = select
         try:
             if link.startswith('magnet:'):
                 self.ext_hash = _get_hash_magnet(link)
@@ -44,9 +42,9 @@ class QbDownloader:
                 sendMessage("This Torrent already added!", self.__listener.bot, self.__listener.message)
                 return self.client.auth_log_out()
             if link.startswith('magnet:'):
-                op = self.client.torrents_add(link, save_path=path)
+                op = self.client.torrents_add(link, save_path=path, ratio_limit=ratio, seeding_time_limit=seed_time)
             else:
-                op = self.client.torrents_add(torrent_files=[link], save_path=path)
+                op = self.client.torrents_add(torrent_files=[link], save_path=path, ratio_limit=ratio, seeding_time_limit=seed_time)
             sleep(0.3)
             if op.lower() == "ok.":
                 tor_info = self.client.torrents_info(torrent_hashes=self.ext_hash)
@@ -109,24 +107,23 @@ class QbDownloader:
                     self.__onDownloadError("Dead Torrent!")
             elif tor_info.state == "downloading":
                 self.__stalled_time = time()
-                if not self.__dupChecked and STOP_DUPLICATE and ospath.isdir(f'{self.__path}') and not self.__listener.isLeech and not self.select:
+                if not self.__stopDup_check and not self.__select and STOP_DUPLICATE and not self.__listener.isLeech:
                     LOGGER.info('Checking File/Folder if already in Drive')
-                    qbname = str(listdir(f'{self.__path}')[-1])
-                    if qbname.endswith('.!qB'):
-                        qbname = ospath.splitext(qbname)[0]
+                    qbname = tor_info.content_path.rsplit('/', 1)[-1].rsplit('.!qB', 1)[0]
                     if self.__listener.isZip:
                         qbname = f"{qbname}.zip"
                     elif self.__listener.extract:
                         try:
-                           qbname = get_base_name(qbname)
+                            qbname = get_base_name(qbname)
                         except:
                             qbname = None
                     if qbname is not None:
-                        qbmsg, button = GoogleDriveHelper().drive_list(qbname, True)
-                        if qbmsg:
+                        cap, f_name = GoogleDriveHelper().drive_list(qbname, True)
+                        if cap:
                             self.__onDownloadError("File/Folder is already available in Drive.")
-                            sendMarkup("Here are the search results:", self.__listener.bot, self.__listener.message, button)
-                    self.__dupChecked = True
+                            cap = f"Here are the search results:\n\n{cap}"
+                            sendFile(self.__listener.bot, self.__listener.message, f_name, cap)
+                    self.__stopDup_check = True
             elif tor_info.state == "stalledDL":
                 if not self.__rechecked and 0.99989999999999999 < tor_info.progress < 1:
                     msg = f"Force recheck - Name: {self.__name} Hash: "
@@ -141,34 +138,32 @@ class QbDownloader:
                 self.client.torrents_recheck(torrent_hashes=self.ext_hash)
             elif tor_info.state == "error":
                 self.__onDownloadError("No enough space for this torrent on device")
-            elif (tor_info.state.lower().endswith("up") or tor_info.state == "uploading") and \
-                 not self.__uploaded and len(listdir(self.__path)) != 0:
+            elif (tor_info.state.lower().endswith("up") or tor_info.state == "uploading") and not self.__uploaded:
                 self.__uploaded = True
                 if not self.__listener.seed:
                     self.client.torrents_pause(torrent_hashes=self.ext_hash)
-                if self.select:
+                if self.__select:
                     clean_unwanted(self.__path)
                 self.__listener.onDownloadComplete()
-                if self.__listener.seed and not self.__listener.isLeech and not self.__listener.extract:
+                if self.__listener.seed:
                     with download_dict_lock:
                         if self.__listener.uid not in download_dict:
-                            self.client.torrents_delete(torrent_hashes=self.ext_hash, delete_files=True)
-                            self.client.auth_log_out()
-                            self.__periodic.cancel()
+                            self.__remove_torrent()
                             return
                         download_dict[self.__listener.uid] = QbDownloadStatus(self.__listener, self)
                     self.is_seeding = True
                     update_all_messages()
-                    LOGGER.info(f"Seeding started: {self.__name}")
+                    LOGGER.info(f"Seeding started: {self.__name} - Hash: {self.ext_hash}")
                 else:
-                    self.client.torrents_delete(torrent_hashes=self.ext_hash, delete_files=True)
-                    self.client.auth_log_out()
-                    self.__periodic.cancel()
+                    self.__remove_torrent()
             elif tor_info.state == 'pausedUP' and self.__listener.seed:
                 self.__listener.onUploadError(f"Seeding stopped with Ratio: {round(tor_info.ratio, 3)} and Time: {get_readable_time(tor_info.seeding_time)}")
-                self.client.torrents_delete(torrent_hashes=self.ext_hash, delete_files=True)
-                self.client.auth_log_out()
-                self.__periodic.cancel()
+                self.__remove_torrent()
+            elif tor_info.state == 'pausedDL' and tor_info.completion_on != 0:
+                # recheck torrent incase one of seed limits reached
+                # sometimes it stuck on pausedDL from maxRatioAction but it should be pausedUP
+                LOGGER.info("Recheck on complete manually! PausedDL")
+                self.client.torrents_recheck(torrent_hashes=self.ext_hash)
         except Exception as e:
             LOGGER.error(str(e))
 
@@ -177,6 +172,9 @@ class QbDownloader:
         self.client.torrents_pause(torrent_hashes=self.ext_hash)
         sleep(0.3)
         self.__listener.onDownloadError(err)
+        self.__remove_torrent()
+
+    def __remove_torrent(self):
         self.client.torrents_delete(torrent_hashes=self.ext_hash, delete_files=True)
         self.client.auth_log_out()
         self.__periodic.cancel()
