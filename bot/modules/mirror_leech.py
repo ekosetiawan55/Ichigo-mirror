@@ -1,4 +1,4 @@
-from aiofiles.os import path as aiopath
+from aiofiles.os import path as aiopath, remove
 from base64 import b64encode
 from pyrogram.filters import command
 from pyrogram.handlers import MessageHandler
@@ -22,16 +22,23 @@ from bot.helper.ext_utils.links_utils import (
     is_gdrive_id,
 )
 from bot.helper.listeners.task_listener import TaskListener
-from bot.helper.mirror_utils.download_utils.aria2_download import add_aria2c_download
-from bot.helper.mirror_utils.download_utils.direct_downloader import add_direct_download
-from bot.helper.mirror_utils.download_utils.direct_link_generator import (
+from bot.helper.mirror_leech_utils.download_utils.aria2_download import (
+    add_aria2c_download,
+)
+from bot.helper.mirror_leech_utils.download_utils.direct_downloader import (
+    add_direct_download,
+)
+from bot.helper.mirror_leech_utils.download_utils.direct_link_generator import (
     direct_link_generator,
 )
-from bot.helper.mirror_utils.download_utils.gd_download import add_gd_download
-from bot.helper.mirror_utils.download_utils.jd_download import add_jd_download
-from bot.helper.mirror_utils.download_utils.qbit_download import add_qb_torrent
-from bot.helper.mirror_utils.download_utils.rclone_download import add_rclone_download
-from bot.helper.mirror_utils.download_utils.telegram_download import (
+from bot.helper.mirror_leech_utils.download_utils.gd_download import add_gd_download
+from bot.helper.mirror_leech_utils.download_utils.jd_download import add_jd_download
+from bot.helper.mirror_leech_utils.download_utils.qbit_download import add_qb_torrent
+from bot.helper.mirror_leech_utils.download_utils.nzb_downloader import add_nzb
+from bot.helper.mirror_leech_utils.download_utils.rclone_download import (
+    add_rclone_download,
+)
+from bot.helper.mirror_leech_utils.download_utils.telegram_download import (
     TelegramDownloadHelper,
 )
 from bot.helper.telegram_helper.bot_commands import BotCommands
@@ -48,6 +55,7 @@ class Mirror(TaskListener):
         isQbit=False,
         isLeech=False,
         isJd=False,
+        isNzb=False,
         sameDir=None,
         bulk=None,
         multiTag=None,
@@ -67,13 +75,14 @@ class Mirror(TaskListener):
         self.isQbit = isQbit
         self.isLeech = isLeech
         self.isJd = isJd
+        self.isNzb = isNzb
 
     @new_task
     async def newEvent(self):
         text = self.message.text.split("\n")
         input_list = text[0].split(" ")
 
-        arg_base = {
+        args = {
             "-d": False,
             "-j": False,
             "-s": False,
@@ -85,6 +94,7 @@ class Mirror(TaskListener):
             "-f": False,
             "-fd": False,
             "-fu": False,
+            "-ml": False,
             "-i": 0,
             "-sp": 0,
             "link": "",
@@ -98,9 +108,10 @@ class Mirror(TaskListener):
             "-t": "",
             "-ca": "",
             "-cv": "",
+            "-ns": "",
         }
 
-        args = arg_parser(input_list[1:], arg_base)
+        arg_parser(input_list[1:], args)
 
         self.select = args["-s"]
         self.seed = args["-d"]
@@ -120,6 +131,8 @@ class Mirror(TaskListener):
         self.forceUpload = args["-fu"]
         self.convertAudio = args["-ca"]
         self.convertVideo = args["-cv"]
+        self.nameSub = args["-ns"]
+        self.mixedLeech = args["-ml"]
 
         headers = args["-h"]
         isBulk = args["-b"]
@@ -131,6 +144,7 @@ class Mirror(TaskListener):
         seed_time = None
         reply_to = None
         file_ = None
+        session = ""
 
         try:
             self.multi = int(args["-i"])
@@ -185,7 +199,7 @@ class Mirror(TaskListener):
                 self.link = reply_to.text.split("\n", 1)[0].strip()
         if is_telegram_link(self.link):
             try:
-                reply_to, self.session = await get_tg_link_message(self.link)
+                reply_to, session = await get_tg_link_message(self.link)
             except Exception as e:
                 await sendMessage(self.message, f"ERROR: {e}")
                 self.removeFromSameDir()
@@ -211,6 +225,7 @@ class Mirror(TaskListener):
                 self.isQbit,
                 self.isLeech,
                 self.isJd,
+                self.isNzb,
                 self.sameDir,
                 self.bulk,
                 self.multiTag,
@@ -238,7 +253,7 @@ class Mirror(TaskListener):
                     reply_to = None
             elif reply_to.document and (
                 file_.mime_type == "application/x-bittorrent"
-                or file_.file_name.endswith(".torrent")
+                or file_.file_name.endswith((".torrent", ".dlc", ".nzb"))
             ):
                 self.link = await reply_to.download()
                 file_ = None
@@ -254,6 +269,7 @@ class Mirror(TaskListener):
             and not await aiopath.exists(self.link)
             and not is_rclone_path(self.link)
             and not is_gdrive_id(self.link)
+            and not is_gdrive_link(self.link)
         ):
             await sendMessage(
                 self.message, COMMAND_USAGE["mirror"][0], COMMAND_USAGE["mirror"][1]
@@ -273,6 +289,7 @@ class Mirror(TaskListener):
 
         if (
             not self.isJd
+            and not self.isNzb
             and not self.isQbit
             and not is_magnet(self.link)
             and not is_rclone_path(self.link)
@@ -299,7 +316,9 @@ class Mirror(TaskListener):
                         return
 
         if file_ is not None:
-            await TelegramDownloadHelper(self).add_download(reply_to, f"{path}/")
+            await TelegramDownloadHelper(self).add_download(
+                reply_to, f"{path}/", session
+            )
         elif isinstance(self.link, dict):
             await add_direct_download(self, path)
         elif self.isJd:
@@ -309,8 +328,13 @@ class Mirror(TaskListener):
                 await sendMessage(self.message, f"{e}".strip())
                 self.removeFromSameDir()
                 return
+            finally:
+                if await aiopath.exists(self.link):
+                    await remove(self.link)
         elif self.isQbit:
             await add_qb_torrent(self, path, ratio, seed_time)
+        elif self.isNzb:
+            await add_nzb(self, path)
         elif is_rclone_path(self.link):
             await add_rclone_download(self, f"{path}/")
         elif is_gdrive_link(self.link) or is_gdrive_id(self.link):
@@ -334,6 +358,14 @@ async def qb_mirror(client, message):
     Mirror(client, message, isQbit=True).newEvent()
 
 
+async def jd_mirror(client, message):
+    Mirror(client, message, isJd=True).newEvent()
+
+
+async def nzb_mirror(client, message):
+    Mirror(client, message, isNzb=True).newEvent()
+
+
 async def leech(client, message):
     Mirror(client, message, isLeech=True).newEvent()
 
@@ -342,12 +374,12 @@ async def qb_leech(client, message):
     Mirror(client, message, isQbit=True, isLeech=True).newEvent()
 
 
-async def jd_mirror(client, message):
-    Mirror(client, message, isJd=True).newEvent()
-
-
 async def jd_leech(client, message):
     Mirror(client, message, isLeech=True, isJd=True).newEvent()
+
+
+async def nzb_leech(client, message):
+    Mirror(client, message, isLeech=True, isNzb=True).newEvent()
 
 
 bot.add_handler(
@@ -363,6 +395,18 @@ bot.add_handler(
 )
 bot.add_handler(
     MessageHandler(
+        jd_mirror,
+        filters=command(BotCommands.JdMirrorCommand) & CustomFilters.authorized,
+    )
+)
+bot.add_handler(
+    MessageHandler(
+        nzb_mirror,
+        filters=command(BotCommands.NzbMirrorCommand) & CustomFilters.authorized,
+    )
+)
+bot.add_handler(
+    MessageHandler(
         leech, filters=command(BotCommands.LeechCommand) & CustomFilters.authorized
     )
 )
@@ -373,12 +417,12 @@ bot.add_handler(
 )
 bot.add_handler(
     MessageHandler(
-        jd_mirror,
-        filters=command(BotCommands.JdMirrorCommand) & CustomFilters.authorized,
+        jd_leech, filters=command(BotCommands.JdLeechCommand) & CustomFilters.authorized
     )
 )
 bot.add_handler(
     MessageHandler(
-        jd_leech, filters=command(BotCommands.JdLeechCommand) & CustomFilters.authorized
+        nzb_leech,
+        filters=command(BotCommands.NzbLeechCommand) & CustomFilters.authorized,
     )
 )
